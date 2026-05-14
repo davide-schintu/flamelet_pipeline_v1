@@ -1,0 +1,5 @@
+
+1. To install the C++ lib for openfoam just run wmake. 
+2. To install the python wrapper:
+	2.1 In a python environment pip install pybind11
+        2.2 pip install .

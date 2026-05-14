@@ -1,0 +1,41 @@
+[case]
+type = "slf_ideal"
+
+[mechanism]
+yaml = "ramec.yaml"
+phase = "gas"
+fuel_species = "CH4"
+oxidizer_species = "O2"
+
+[streams]
+pressure_values = [1e5, 3e5, 5e5, 7e5, 1e6, 2e6]
+fuel_temperature = 300.0
+oxidizer_temperature = 300.0
+
+[flamelet]
+chi_values = [1e4, 1e3, 1e2, 1e1, 1.0, 1e-1]
+grid_points = 128
+diss_rate_ref = "stoichiometric"
+retry_failed_with_seed = true
+skip_failed = false
+
+[interpolation]
+mode = "linspace"
+start = 1.0e-5 
+points = 256
+
+[output]
+h5 = "out/flamelets.h5"
+csv_output_dir = "out/csv"
+csv_fields = ["Z", "T", "rho", "cp", "h", "mu", "lam", "alpha", "psi", "sound_speed", "Rmix"]
+
+[pdf]
+averaging = "reynolds"
+s_vector = [0.0, 0.001, 0.002, 0.005]
+
+
+[execution]
+export_csv = true
+workers = 4
+verbose = true
+solver_verbose = false

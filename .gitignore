@@ -1,0 +1,13 @@
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.DS_Store
+out/
+build/
+*.egg-info/
+
+# Keep source under version control; rebuild platform-specific modules when needed.
+flamelet_pipeline/rfthermo/build/
+flamelet_pipeline/cpp_pdf/build/
+!flamelet_pipeline/rfthermo/build/.gitkeep
+!flamelet_pipeline/cpp_pdf/build/.gitkeep

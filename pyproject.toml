@@ -1,0 +1,32 @@
+[project]
+name = "unified-flamelet-pipeline"
+version = "0.1.0"
+description = "Unified SLF/FPV flamelet pipeline with canonical HDF5 and CSV convolution."
+requires-python = ">=3.11"
+dependencies = [
+  "numpy",
+  "scipy",
+  "h5py",
+  "cantera",
+  "pybind11",
+]
+
+[project.scripts]
+flamelet-pipeline = "flamelet_pipeline.__main__:main"
+
+[tool.setuptools]
+packages = ["flamelet_pipeline"]
+
+[tool.setuptools.package-data]
+flamelet_pipeline = [
+  "cpp_pdf/Makefile",
+  "cpp_pdf/CMakeLists.txt",
+  "cpp_pdf/include/*.hpp",
+  "cpp_pdf/src/*.cpp",
+  "rfthermo/setup.py",
+  "rfthermo/README",
+  "rfthermo/data.pkl",
+  "rfthermo/data/*",
+  "rfthermo/include/*.h",
+  "rfthermo/src/*.cpp",
+]
