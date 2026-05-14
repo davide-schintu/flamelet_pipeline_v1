@@ -1,0 +1,57 @@
+[case]
+type = "fpv_ideal"
+
+[mechanism]
+yaml = "ramec.yaml"
+phase = "gas"
+fuel_species = "CH4"
+oxidizer_species = "O2"
+
+[streams]
+pressure_values = [2e6]
+fuel_temperature = 285
+oxidizer_temperature = 270
+
+[flamelet]
+chi_values = [1e4, 1e3, 1e2, 1e1, 1.0, 1e-1]
+grid_points = 128
+diss_rate_ref = "stoichiometric"
+retry_failed_with_seed = true
+skip_failed = false
+
+[interpolation]
+mode = "linspace"
+start = 1.0e-5
+points = 256
+
+[fpv]
+extinction_database = "cache/extinction_chi.json"
+progress_species = ["H2O", "CO2", "CO", "H2"]
+extinction_solver_tolerance = 1e-3
+extinction_growth_factor = 10.0
+extinction_max_growth_steps = 5
+extinction_bisect_steps = 4
+#extinction_rel_tol = 0.3
+burning_delta_T_min = 200.0
+debug_unsteady_output_dir = "out_fpv/debug_unsteady"
+
+[fpv.c_grid]
+mode = "linspace"
+start = 0.0
+stop = 1.0
+points = 50
+
+[output]
+h5 = "out_fpv/flamelets.h5"
+csv_output_dir = "out_fpv/csv"
+csv_fields = ["Z", "C", "Yc", "T", "rho", "cp", "h", "mu", "lam", "alpha", "psi", "sound_speed", "Rmix"]
+
+[pdf]
+averaging = "reynolds"
+s_vector = [0.0, 0.001, 0.002, 0.005]
+
+[execution]
+export_csv = false
+workers = 1
+verbose = true
+solver_verbose = false
