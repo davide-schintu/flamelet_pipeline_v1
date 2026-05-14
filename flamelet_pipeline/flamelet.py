@@ -659,14 +659,57 @@ def _run_fpv_source_family(config: PipelineConfig, pressure: float) -> PressureF
             flush=True,
         )
 
-    burning_slice = Library.squeeze(burning_library[:, int(order[-1])])
-    burning_slice.extra_attributes["mech_spec"] = specs.mech_spec
-    ext_specs = FlameletSpec(library_slice=burning_slice, stoich_dissipation_rate=chi_ext)
-    ext_flamelet = Flamelet(ext_specs)
-    unsteady = ext_flamelet.integrate_to_steady(
-        steady_tolerance=float(get_optional(config.raw, 1.0e-4, "fpv", "extinction_steady_tolerance")),
-        **dict(get_optional(config.raw, {}, "fpv", "extinction_transient_args")),
+    # Use the last burning flamelet found by the extinction search as seed for
+    # the extinguishing transient.  Do not start from the highest point of the
+    # original burning branch if the search found a much larger chi_burn.
+    #
+    # Example:
+    #   original burning branch max chi = 1e4
+    #   extinction search chi_burn     = 2.4e5
+    #   extinction search chi_ext      = 2.7e5
+    #
+    # Starting the transient directly from 1e4 to 2.7e5 is too aggressive and can
+    # easily produce NaNs in Spitfire.  Rebuilding the seed at chi_burn makes the
+    # transient much better conditioned.
+    burning_seed_library = _solve_single_flamelet(
+        builder,
+        specs,
+        chi_burn,
+        config,
+        pressure,
+        include_extinguished=True,
+        skip_failed=True,
     )
+
+    if burning_seed_library is None:
+        print(
+            f"[fpv] P={pressure:g} Pa: could not rebuild burning seed at "
+            f"chi_burn={chi_burn:g}; falling back to highest original burning-library slice",
+            flush=True,
+        )
+        burning_slice = Library.squeeze(burning_library[:, int(order[-1])])
+    else:
+        _add_ideal_gas_properties(burning_seed_library, specs.mech_spec, pressure)
+        burning_slice = Library.squeeze(burning_seed_library[:, 0])
+
+    burning_slice.extra_attributes["mech_spec"] = specs.mech_spec
+    ext_specs = FlameletSpec(library_slice=burning_slice, stoich_dissipation_rate=1.5*chi_ext)
+    ext_flamelet = Flamelet(ext_specs)
+
+    try:
+        unsteady = ext_flamelet.integrate_to_steady(
+            steady_tolerance=float(get_optional(config.raw, 1.0e-4, "fpv", "extinction_steady_tolerance")),
+            **dict(get_optional(config.raw, {}, "fpv", "extinction_transient_args")),
+        )
+    except Exception as e:
+        print(f"[fpv] P={pressure:g} Pa: could not integrate extinguishing branch: {e}")
+        print("Trying with smaller timestep")
+        unsteady = ext_flamelet.integrate_to_steady(
+            steady_tolerance=float(get_optional(config.raw, 1.0e-4, "fpv", "extinction_steady_tolerance")),
+            **dict(get_optional(config.raw, {}, "fpv", "extinction_transient_args")),
+            first_time_step=1e-10,
+        )
+
     _add_ideal_gas_properties(unsteady, specs.mech_spec, pressure)
 
     interp_burning = interpolate_library(burning_library, z)
