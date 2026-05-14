@@ -6,9 +6,12 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import json
+import os
 from spitfire import ChemicalMechanismSpec, Flamelet, FlameletSpec, Library, Dimension, get_ct_solution_array
 
 from .config import PipelineConfig, build_grid, get, get_optional, resolve_path
+from typing import Tuple, Optional
 
 
 @dataclass
@@ -211,6 +214,359 @@ def _add_ideal_gas_properties(library, mechanism: ChemicalMechanismSpec, pressur
     library["sound_speed"] = sound_speed
 
 
+# -----------------------------------------------------------------------------
+# Extinction search utilities
+# -----------------------------------------------------------------------------
+
+def _is_flamelet_burning(library: Library, T_oxy: float, T_fuel: float, delta_T: float) -> bool:
+    """
+    Determine whether a flamelet solution represents a burning state.
+
+    Parameters
+    ----------
+    library:
+        Flamelet solution library returned by spitfire.  It is expected to contain
+        a "temperature" field.
+    T_oxy, T_fuel:
+        Temperatures of the oxidizer and fuel inlet streams, used to define a
+        baseline cold temperature.
+    delta_T:
+        Minimum temperature rise above the cold inlet temperature that qualifies
+        as burning.  If the maximum flamelet temperature does not exceed
+        max(T_oxy, T_fuel) + delta_T the flamelet is considered extinguished.
+
+    Returns
+    -------
+    bool
+        True if the flamelet is burning, False if extinguished or invalid.
+    """
+    try:
+        T = np.asarray(library["temperature"], dtype=float)
+    except Exception:
+        return False
+    if T.size == 0 or not np.isfinite(T).any():
+        return False
+    Tmax = float(np.nanmax(T))
+    if not np.isfinite(Tmax):
+        return False
+    return Tmax > max(float(T_oxy), float(T_fuel)) + float(delta_T)
+
+
+def _solve_single_flamelet(
+    builder,
+    specs: FlameletSpec,
+    chi: float,
+    config: PipelineConfig,
+    pressure: float,
+    include_extinguished: bool = True,
+    skip_failed: bool = True,
+) -> Optional[Library]:
+    """
+    Solve one steady flamelet at a specified stoichiometric scalar dissipation rate.
+
+    This function is used only during the FPV extinction search. Therefore it can
+    use looser solver tolerances than the final manifold construction.
+    """
+
+    tolerance = float(
+        get_optional(
+            config.raw,
+            get_optional(config.raw, 1.0e-6, "flamelet", "tolerance"),
+            "fpv",
+            "extinction_solver_tolerance",
+        )
+    )
+
+    use_psitc = bool(
+        get_optional(
+            config.raw,
+            get_optional(config.raw, True, "flamelet", "use_psitc"),
+            "fpv",
+            "extinction_use_psitc",
+        )
+    )
+
+    solver = get_optional(
+        config.raw,
+        get_optional(config.raw, "compute_steady_state", "flamelet", "solver"),
+        "fpv",
+        "extinction_solver",
+    )
+
+    transient_args = dict(
+        get_optional(
+            config.raw,
+            get_optional(config.raw, {}, "flamelet", "transient_args"),
+            "fpv",
+            "extinction_search_transient_args",
+        )
+    )
+
+    try:
+        lib = _call_slf_builder(
+            builder,
+            specs,
+            diss_rate_values=np.asarray([float(chi)], dtype=float),
+            diss_rate_ref=get_optional(config.raw, "stoichiometric", "flamelet", "diss_rate_ref"),
+            verbose=bool(get_optional(config.raw, True, "execution", "verbose")),
+            solver_verbose=bool(get_optional(config.raw, False, "execution", "solver_verbose")),
+            transient_args=transient_args,
+            solver=solver,
+            tolerance=tolerance,
+            use_psitc=use_psitc,
+            skip_failed=bool(skip_failed),
+            retry_failed_with_seed=bool(get_optional(config.raw, True, "flamelet", "retry_failed_with_seed")),
+            include_extinguished=bool(include_extinguished),
+        )
+
+        if lib.dissipation_rate_stoich_values.size == 0:
+            return None
+
+        return lib
+
+    except Exception as exc:
+        print(
+            f"[fpv] P={pressure:g} Pa: chi={chi:g} failed during extinction search: {exc}",
+            flush=True,
+        )
+        return None
+
+
+
+def _load_extinction_database(path: Optional[str]) -> dict:
+    """
+    Load a JSON database mapping pressures to extinction chi values.
+
+    Parameters
+    ----------
+    path:
+        Path to the database file.  If None or the file does not exist, an empty
+        dictionary is returned.
+
+    Returns
+    -------
+    dict
+        Database content as a Python dictionary mapping stringified pressures
+        to dictionaries containing ``chi_burn`` and ``chi_ext``.  Additional fields
+        may be present.
+    """
+    if not path:
+        return {}
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as handle:
+                return json.load(handle) or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_extinction_database(path: Optional[str], data: dict) -> None:
+    """
+    Write the extinction chi database back to disk.
+
+    The directory containing the database will be created if it does not exist.
+
+    Parameters
+    ----------
+    path:
+        Path to the JSON file.
+    data:
+        Dictionary mapping pressures to extinction information.
+    """
+    if not path:
+        return
+    try:
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+    except Exception:
+        # If saving fails, silently ignore – the search can still proceed.
+        pass
+
+
+def _find_extinction_chi(
+    config: PipelineConfig,
+    pressure: float,
+    builder,
+    specs: FlameletSpec,
+    initial_burn_chi: float,
+) -> Tuple[float, float]:
+    """
+    Search for the extinction scalar dissipation rate at a given pressure.
+
+    If an extinction database exists, the cached chi_ext is used only as the
+    initial guess. The code still verifies it and rebuilds the burning/extinct
+    bracket before returning.
+    """
+
+    db_path = get_optional(config.raw, None, "fpv", "extinction_database")
+    db_resolved: Optional[str] = None
+    if db_path:
+        db_resolved = str(resolve_path(config.path, db_path))
+
+    db = _load_extinction_database(db_resolved)
+    pressure_key = f"{pressure:g}"
+
+    T_oxy = float(get(config.raw, "streams", "oxidizer_temperature"))
+    T_fuel = float(get(config.raw, "streams", "fuel_temperature"))
+    delta_T_min = float(get_optional(config.raw, 200.0, "fpv", "burning_delta_T_min"))
+
+    growth = float(get_optional(config.raw, 10.0, "fpv", "extinction_growth_factor"))
+    max_growth_steps = int(get_optional(config.raw, 8, "fpv", "extinction_max_growth_steps"))
+    max_bisect_steps = int(get_optional(config.raw, 12, "fpv", "extinction_bisect_steps"))
+    rel_tol = float(get_optional(config.raw, 0.05, "fpv", "extinction_rel_tol"))
+
+    requested_chi = np.asarray(get(config.raw, "flamelet", "chi_values"), dtype=float)
+    last_toml_chi = float(np.max(requested_chi))
+
+    chi_guess = None
+
+    if pressure_key in db:
+        record = db[pressure_key]
+        try:
+            chi_guess = float(record["chi_ext"])
+            print(
+                f"[fpv] P={pressure:g} Pa: using cached chi_ext={chi_guess:g} as first guess",
+                flush=True,
+            )
+        except Exception:
+            chi_guess = None
+
+    if chi_guess is None:
+        chi_guess = float(
+            get_optional(
+                config.raw,
+                initial_burn_chi * growth,
+                "fpv",
+                "extinction_chi_guess",
+            )
+        )
+
+    if chi_guess <= initial_burn_chi:
+        chi_guess = initial_burn_chi * growth
+        print(
+            f"[fpv] P={pressure:g} Pa: no extinction cache found, starting from chi_guess={chi_guess:g}",
+            flush=True,
+        )
+
+    def try_chi(val: float) -> Tuple[bool, Optional[Library]]:
+        lib = _solve_single_flamelet(
+            builder,
+            specs,
+            val,
+            config,
+            pressure,
+            include_extinguished=True,
+            skip_failed=True,
+        )
+
+        if lib is None:
+            return False, None
+
+        _add_ideal_gas_properties(lib, specs.mech_spec, pressure)
+        is_burning = _is_flamelet_burning(lib, T_oxy, T_fuel, delta_T_min)
+
+        print(
+            f"[fpv] P={pressure:g} Pa: chi={val:g} -> "
+            f"{'burning' if is_burning else 'extinct'}",
+            flush=True,
+        )
+
+        return is_burning, lib
+
+    # ------------------------------------------------------------------
+    # 1. Bracketing around chi_guess
+    # ------------------------------------------------------------------
+
+    if chi_guess <= initial_burn_chi:
+        chi_guess = initial_burn_chi * growth
+
+    is_burning_guess, _ = try_chi(chi_guess)
+
+    if is_burning_guess:
+        chi_low = chi_guess
+        chi_high = chi_guess * growth
+
+        for _ in range(max_growth_steps):
+            is_burning_high, _ = try_chi(chi_high)
+
+            if not is_burning_high:
+                break
+
+            chi_low = chi_high
+            chi_high *= growth
+
+        else:
+            raise RuntimeError(
+                f"Could not bracket extinction at P={pressure:g} Pa. "
+                f"chi={chi_high:g} is still burning after {max_growth_steps} growth steps."
+            )
+
+    else:
+        # chi_guess failed or was classified as extinguished.
+        # Do not retest initial_burn_chi with the single-flamelet solver:
+        # initial_burn_chi comes from the already-built burning branch and is trusted.
+        chi_low = initial_burn_chi
+        chi_high = chi_guess
+
+        if chi_high <= chi_low:
+            chi_high = chi_low * growth
+
+    if chi_low <= 0.0 or chi_high <= 0.0:
+        raise RuntimeError(
+            f"Invalid extinction bracket at P={pressure:g} Pa: "
+            f"chi_low={chi_low:g}, chi_high={chi_high:g}"
+        )
+
+    print(
+        f"[fpv] P={pressure:g} Pa: initial extinction bracket "
+        f"[{chi_low:g}, {chi_high:g}]",
+        flush=True,
+    )
+
+    # ------------------------------------------------------------------
+    # 2. Logarithmic bisection
+    # ------------------------------------------------------------------
+
+    for _ in range(max_bisect_steps):
+        if chi_high / chi_low - 1.0 <= rel_tol:
+            break
+
+        chi_mid = float(np.sqrt(chi_low * chi_high))
+        is_burning_mid, _ = try_chi(chi_mid)
+
+        if is_burning_mid:
+            chi_low = chi_mid
+        else:
+            chi_high = chi_mid
+
+    chi_burn_final = float(chi_low)
+    chi_ext_final = float(chi_high)
+
+    print(
+        f"[fpv] P={pressure:g} Pa: final extinction bracket "
+        f"chi_burn={chi_burn_final:g}, chi_ext={chi_ext_final:g}, "
+        f"ratio={chi_ext_final / chi_burn_final:g}",
+        flush=True,
+    )
+
+    db[pressure_key] = {
+        "pressure": float(pressure),
+        "chi_burn": chi_burn_final,
+        "chi_ext": chi_ext_final,
+        "T_oxy": T_oxy,
+        "T_fuel": T_fuel,
+        "burning_delta_T_min": delta_T_min,
+        "extinction_rel_tol": rel_tol,
+    }
+
+    _save_extinction_database(db_resolved, db)
+
+    return chi_burn_final, chi_ext_final
+
+
 def _run_fpv_ideal(config: PipelineConfig, pressure: float) -> PressureFlamelet:
     slf = _run_fpv_source_family(config, pressure)
     product_species = get_optional(config.raw, ["CO2", "H2O", "CO", "H2"], "fpv", "progress_species")
@@ -285,17 +641,25 @@ def _run_fpv_source_family(config: PipelineConfig, pressure: float) -> PressureF
     if burning_chi.size == 0:
         raise RuntimeError("FPV quench search produced no burning flamelets.")
     chi_burn = float(burning_chi[-1])
-    higher_requested = requested_chi_sorted[requested_chi_sorted > chi_burn * (1.0 + 1.0e-8)]
-    chi_ext = float(higher_requested[0]) if higher_requested.size else chi_burn * float(get_optional(config.raw, 1.25, "fpv", "extinction_chi_factor"))
-    chi_ext = float(get_optional(config.raw, chi_ext, "fpv", "extinction_chi"))
-    if chi_ext <= chi_burn:
-        chi_ext = chi_burn * float(get_optional(config.raw, 1.25, "fpv", "extinction_chi_factor"))
-    print(
-        f"[fpv] P={pressure:g} Pa: chi_burn={chi_burn:g}, integrating extinguishing branch at chi_ext={chi_ext:g}",
-        flush=True,
-    )
 
-    burning_slice = Library.squeeze(burning_library[:, int(np.argmax(burning_chi))])
+    # Determine chi_ext either via explicit configuration or via automated search.
+    chi_ext_override = get_optional(config.raw, None, "fpv", "extinction_chi")
+    if chi_ext_override is not None:
+        chi_ext = float(chi_ext_override)
+        if chi_ext <= chi_burn:
+            chi_ext = chi_burn * float(get_optional(config.raw, 1.25, "fpv", "extinction_chi_factor"))
+        print(
+            f"[fpv] P={pressure:g} Pa: chi_burn={chi_burn:g}, using configured chi_ext={chi_ext:g}",
+            flush=True,
+        )
+    else:
+        chi_burn, chi_ext = _find_extinction_chi(config, pressure, builder, specs, chi_burn)
+        print(
+            f"[fpv] P={pressure:g} Pa: chi_burn={chi_burn:g}, integrating extinguishing branch at chi_ext={chi_ext:g}",
+            flush=True,
+        )
+
+    burning_slice = Library.squeeze(burning_library[:, int(order[-1])])
     burning_slice.extra_attributes["mech_spec"] = specs.mech_spec
     ext_specs = FlameletSpec(library_slice=burning_slice, stoich_dissipation_rate=chi_ext)
     ext_flamelet = Flamelet(ext_specs)
