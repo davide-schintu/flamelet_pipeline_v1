@@ -386,6 +386,89 @@ def _save_extinction_database(path: Optional[str], data: dict) -> None:
         pass
 
 
+def _save_unsteady_debug_npz(
+    config: PipelineConfig,
+    pressure: float,
+    unsteady: Library,
+    species_fields: list[str],
+) -> None:
+    """
+    Save the raw extinguishing unsteady library for debugging.
+
+    The output is a compressed NPZ file containing:
+      - dimension names;
+      - common coordinates, if available;
+      - all 1D/2D properties in the unsteady library;
+      - species mass fractions, if available.
+
+    Enable with:
+
+    [fpv]
+    debug_unsteady_output_dir = "out_fpv/debug_unsteady"
+    """
+    debug_dir = get_optional(config.raw, None, "fpv", "debug_unsteady_output_dir")
+    if debug_dir is None:
+        return
+
+    out_dir = resolve_path(config.path, debug_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = out_dir / f"unsteady_extinction_P_{pressure:g}.npz"
+
+    payload: dict[str, np.ndarray] = {}
+
+    dim_names = [dim.name for dim in unsteady.dims]
+    payload["dim_names"] = np.asarray(dim_names, dtype="S")
+
+    for attr in (
+        "mixture_fraction_values",
+        "time_values",
+        "time",
+        "times",
+        "t_values",
+    ):
+        if hasattr(unsteady, attr):
+            try:
+                payload[attr] = np.asarray(getattr(unsteady, attr))
+            except Exception:
+                pass
+
+    for prop in unsteady.props:
+        try:
+            arr = np.asarray(unsteady[prop])
+        except Exception:
+            continue
+
+        if arr.ndim <= 2:
+            safe_name = prop.replace(" ", "_").replace("/", "_")
+            payload[safe_name] = arr
+
+    species_arrays = []
+    species_names = []
+
+    for name in species_fields:
+        if name in unsteady.props:
+            try:
+                species_arrays.append(np.asarray(unsteady[name]))
+                species_names.append(name.replace("mass fraction ", ""))
+            except Exception:
+                pass
+
+    if species_arrays:
+        try:
+            payload["species_names"] = np.asarray(species_names, dtype="S")
+            payload["species_Y_raw"] = np.stack(species_arrays, axis=-1)
+        except Exception:
+            pass
+
+    np.savez_compressed(out_path, **payload)
+
+    print(
+        f"[fpv] P={pressure:g} Pa: saved unsteady extinction debug library to {out_path}",
+        flush=True,
+    )
+
+
 def _find_extinction_chi(
     config: PipelineConfig,
     pressure: float,
@@ -575,13 +658,54 @@ def _run_fpv_ideal(config: PipelineConfig, pressure: float) -> PressureFlamelet:
     if not indices:
         raise ValueError(f"None of fpv.progress_species={product_species!r} exists in the flamelet species.")
     yc_source = np.sum(slf.species_y[:, :, indices], axis=2)
-    yc_min = np.nanmin(yc_source, axis=0)
-    yc_max = np.nanmax(yc_source, axis=0)
+
+    # The remapping to C is performed row-by-row at fixed Z.
+    # Therefore Yc must be normalized at fixed Z, not per source table.
+    yc_min = np.nanmin(yc_source, axis=1)
+    yc_max = np.nanmax(yc_source, axis=1)
     denom = yc_max - yc_min
+
     if np.any(denom <= 0.0):
         bad = np.where(denom <= 0.0)[0]
-        raise RuntimeError(f"FPV progress variable has zero range for source tables {bad.tolist()}.")
-    c_source = (yc_source - yc_min[None, :]) / denom[None, :]
+        bad_preview = bad[:20].tolist()
+        raise RuntimeError(
+            f"FPV progress variable has zero range for Z rows {bad_preview}. "
+            f"Total bad rows: {bad.size}."
+        )
+
+    c_source = (yc_source - yc_min[:, None]) / denom[:, None]
+
+    c_min_per_z = np.nanmin(c_source, axis=1)
+    c_max_per_z = np.nanmax(c_source, axis=1)
+
+    print(
+        f"[fpv] C-source coverage over Z: "
+        f"min(C_min)={np.nanmin(c_min_per_z):g}, "
+        f"max(C_min)={np.nanmax(c_min_per_z):g}, "
+        f"min(C_max)={np.nanmin(c_max_per_z):g}, "
+        f"max(C_max)={np.nanmax(c_max_per_z):g}",
+        flush=True,
+    )
+
+    duplicate_rows = 0
+    for iz in range(c_source.shape[0]):
+        c_row = c_source[iz, :]
+        c_good = c_row[np.isfinite(c_row)]
+        if c_good.size <= 1:
+            continue
+
+        c_sorted = np.sort(c_good)
+        dc = np.diff(c_sorted)
+
+        if np.any(dc < 1.0e-8):
+            duplicate_rows += 1
+
+    if duplicate_rows:
+        print(
+            f"[fpv] WARNING: {duplicate_rows}/{c_source.shape[0]} Z rows contain "
+            f"nearly duplicated C-source values. Interpolation may average multiple branches.",
+            flush=True,
+        )
     print(
         f"[fpv] P={pressure:g} Pa: remapping {slf.coord.size} source tables "
         f"to square ZxC grid ({slf.z.size} x {c_grid.size})",
@@ -715,6 +839,9 @@ def _run_fpv_source_family(config: PipelineConfig, pressure: float) -> PressureF
     interp_burning = interpolate_library(burning_library, z)
     fields = {name: np.asarray(values)[:, order] for name, values in interp_burning["fields"].items()}
     species_fields = list(interp_burning["species_fields"])
+
+    _save_unsteady_debug_npz(config, pressure, unsteady, species_fields)
+
     species_names = [name.replace("mass fraction ", "") for name in species_fields]
     species_y = np.asarray(interp_burning["species_mass_fractions"])[:, order, :]
     source_coord = burning_chi.copy()
