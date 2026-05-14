@@ -33,6 +33,7 @@ extinction_max_growth_steps = 5
 extinction_bisect_steps = 4
 #extinction_rel_tol = 0.3
 burning_delta_T_min = 200.0
+debug_unsteady_output_dir = "out_fpv/debug_unsteady"
 
 [fpv.c_grid]
 mode = "linspace"
