@@ -1,6 +1,7 @@
 #include "../include/functions.h"
 #include <algorithm>
 #include <cmath>
+#include <array>
 #include <stdexcept>
 
 double getZ(double am, double bm, double P, double T,
